@@ -1,0 +1,87 @@
+The platform allows HR professionals to upload CVs and job descriptions, rank candidates based on their skills, and generate shortlists with specific criteria.
+Libraries and Frameworks:
+
+Streamlit (streamlit>=1.28.0):
+Used for creating an interactive web application. This framework simplifies the process of building data-driven apps with Python,
+
+Google GenAI SDK (google-genai>=1.0.0):
+Utilized for integrating Google Gemini (AI model) to analyze CVs against job descriptions.
+
+Python Dotenv (python-dotenv>=1.0.0):
+Loads environment variables from a .env file.
+
+SQLite (sqlite3):
+Used for managing the database that stores candidates, job descriptions, rankings, and shortlisting details.
+
+PyPDF2 (PyPDF2>=3.0.0):
+Extracts text from PDF files. This is particularly useful for reading CVs that are uploaded in PDF format.
+
+Pandas (pandas>=2.0.0):
+Handles data manipulation and analysis. It is used for creating dataframes that help organize and display data, such as candidate details, job descriptions, and rankings.
+
+
+
+
+
+
+Example Process:
+Let's say we have a candidate with the following CV:
+Candidate CV:
+Skills: Python, SQL, Machine Learning, TensorFlow
+Experience: 3 years as Data Analyst
+Job Description (JD):
+Skills Required: Python, SQL, Data Analysis, Machine Learning, TensorFlow, Data Visualization
+Experience: 3+ years in Data Science
+AI Model Output:
+Match Score: 85/100 (Good fit)
+Skills Matched: [Python, SQL, Machine Learning, TensorFlow]
+Skills Gap: [Data Visualization]
+
+Strengths: Strong experience with Python and Machine Learning
+Concerns: Lack of experience in Data Visualization
+Ranked Candidates: After evaluating multiple candidates, the AI ranks them based on their match score (higher score means better fit for the job).
+Ranking Process: The AI outputs a list of candidates sorted by their match score. You can then view their strengths, gaps,
+
+
+
+
+Good [morning/afternoon], everyone! Thanks for joining today’s demo. I’m thrilled to present to you our AI Talent Intelligence Platform, which is designed to revolutionize your recruitment process. 
+If you're looking to streamline candidate selection, boost hiring efficiency, and harness the power of AI for smarter decisions, then you're in for a treat."
+
+“Let’s start with the homepage of the platform. When you first log in, you’re greeted with an intuitive dashboard where you can see important statistics like the total number of uploaded CVs, active job descriptions.
+
+“Next, let’s move on to the CV Upload feature. You can upload multiple candidate CVs at once, whether they are in PDF, TXT format. For this demo, I’ll upload a few CVs.
+Once the files are uploaded, the platform automatically extracts the text from these documents, which includes key details such as skills, qualifications, and experience
+
+Uploading Job Descriptions (JDs):
+
+“Now that we have uploaded the candidate CVs, let’s move on to the Job Descriptions. Similar to CVs, you can either upload JDs as documents or create them manually.
+Here comes the exciting part – Batch Candidate Ranking. This is where our AI system steps in. The platform uses Google’s Gemini AI model to analyze the content of the candidate CVs against the job description we’ve just uploaded.”
+
+“We can select multiple candidates and run a batch analysis to rank them based on how well their CVs match the job description. Let's start the batch ranking process.”
+
+Candidate Ranking with AI:
+
+We use an advanced AI model to rank candidates based on how well their CV matches a given Job Description (JD). Here's how the process works:
+
+Input: The AI compares two key inputs:
+Candidate CV: The candidate’s resume (skills, experience, education).
+Job Description (JD): The job requirements (skills, experience, qualifications).
+Processing: The AI model analyzes both the CV and JD. It evaluates:
+Skills: Does the candidate have the skills listed in the JD? Which skills match?
+Experience: Is the candidate’s work experience relevant to the job?
+Other Factors: Does the candidate meet other requirements such as certifications or technologies?
+
+AI Output:
+Match Score: A score from 0 to 100 that quantifies how well the candidate fits the job.
+Skills Matched: A list of skills that the candidate possesses that match the JD.
+Skills Gap: A list of skills that the candidate lacks, which are required by the JD.
+Strengths: Key strengths of the candidate based on their CV.
+Concerns: Any potential concerns about the candidate, like missing experience or skills.
+
+This allows you to quickly identify the top candidates for the job and make informed decisions based on AI-powered insights.
+
+Shortlisting Candidates:
+“Once the ranking is complete, we can move on to shortlisting. The platform offers multiple options for shortlisting candidates. You can select candidates based on a minimum match score or choose the top N candidates based on their match score.”
+Now, let’s take a quick look at the platform’s settings and database management features. You can view and manage all uploaded CVs, job descriptions, and rankings from the database. This section is where you can perform operations like deleting candidates or job descriptions, or even backing up the database.”
+
