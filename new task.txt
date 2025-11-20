@@ -1,0 +1,84 @@
+This project is about building a multi-agent RAG (Retrieval-Augmented Generation) chatbot that can read two PDFs, understand them, and answer user questions with very high accuracy.
+
+Unlike normal PDF-QA chatbots that use a single agent, this system uses five coordinated AI agents, all connected using LangGraph, to ensure structured reasoning and minimal hallucination.
+
+🚀 What the Project Does
+
+Takes two PDFs from the user
+
+The PDFs are converted into text.
+
+Text is chunked, embedded, and stored in a vector database.
+
+When a user asks a question, the system activates five agents, each doing a specific job:
+
+🧠 The 5 AI Agents
+1️⃣ Query Refiner Agent
+
+Cleans, rewrites, and clarifies the user's raw question.
+
+Removes ambiguity and turns it into a high-quality search query.
+
+Goal: Make sure the system always retrieves the right information.
+
+2️⃣ Document Retriever Agent
+
+Searches both PDFs.
+
+Fetches the most relevant text chunks using embeddings.
+
+Goal: Bring only the important parts from the documents.
+
+3️⃣ Chunk Summarizer Agent
+
+Summarizes each retrieved chunk.
+
+Converts long text into short, meaningful summaries.
+
+Goal: Create compact, information-dense notes for the next agent.
+
+4️⃣ Answer Synthesizer Agent
+
+Takes all summaries and combines them.
+
+Creates a final, well-structured answer.
+
+Goal: Give a clean, complete, human-like response.
+
+5️⃣ Hallucination Guard Agent
+
+Double-checks the synthesized answer.
+
+Validates whether the answer actually matches the PDFs.
+
+Removes hallucinated or unsupported claims.
+
+Goal: Ensure reliable, factual answers.
+
+🔗 Why Use LangGraph?
+
+LangGraph allows you to:
+
+Build workflows with multiple agents connected in sequence
+
+Define edges like:
+Refiner → Retriever → Summarizer → Synthesizer → Guard
+
+Control execution flow
+
+Reduce hallucination
+
+Make the system deterministic and explainable
+
+This turns the chatbot into a pipeline with quality checks, instead of a single LLM guessing answers.
+
+📈 Final Outcome
+
+By the end of the project, you have:
+
+✅ A multi-step RAG pipeline
+✅ Five specialized agents
+✅ A PDF-QA system with higher accuracy
+✅ Structured, traceable reasoning
+✅ A Streamlit UI powered by LangGraph
+✅ A far more reliable chatbot than a standard one-agent RAG bot
