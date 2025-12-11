@@ -1,0 +1,302 @@
+# apps.py
+import os
+import time
+import uuid
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+import streamlit as st
+from dotenv import load_dotenv
+
+from langchain.chains.history_aware_retriever import create_history_aware_retriever
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.retrievers.multi_query import MultiQueryRetriever
+
+
+# -------
+# Logging setup
+# -------
+def setup_logging(level: str | None = None, log_dir: str = "logs") -> logging.Logger:
+    """
+    Configure a dedicated logger with console + rotating file handlers.
+    Avoids modifying the root logger so Streamlit remains stable across reruns.
+    """
+    level = (level or os.getenv("LOG_LEVEL", "INFO")).upper()
+    logger = logging.getLogger("budget_bot")
+    logger.setLevel(level)
+
+    # Prevent duplicate handlers on Streamlit reruns
+    if logger.handlers:
+        return logger
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # Console
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    # Rotating file
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    fh = RotatingFileHandler(
+        filename=os.path.join(log_dir, "app.log"),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    fh.setLevel(level)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    logger.info("Logger initialized. level=%s file=%s", level, os.path.join(log_dir, "app.log"))
+    return logger
+
+
+def redact(value: str | None) -> str:
+    """Redact secrets for logs."""
+    if not value:
+        return "<missing>"
+    if len(value) <= 6:
+        return "***"
+    return value[:2] + "***" + value[-2:]
+
+
+logger = setup_logging()
+
+
+# -----------------------------
+# Environment
+# -----------------------------
+load_dotenv()
+
+hf_token = os.getenv("HF_TOKEN")
+groq_key = os.getenv("GROQ_API_KEY")
+
+# Set for downstream libs; never log raw secrets
+os.environ["HF_TOKEN"] = hf_token or ""
+os.environ["GROQ_API_KEY"] = groq_key or ""
+
+logger.info("Environment loaded. HF_TOKEN=%s | GROQ_API_KEY=%s", redact(hf_token), redact(groq_key))
+
+
+# -----------------------------
+# Initialize embeddings and LLM
+# -----------------------------
+try:
+    t0 = time.perf_counter()
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    logger.info("Embeddings initialized: model=all-MiniLM-L6-v2 | %.2f ms", (time.perf_counter() - t0) * 1000)
+except Exception:
+    logger.exception("Failed to initialize embeddings")
+    st.error("Failed to initialize embeddings. See logs for details.")
+    st.stop()
+
+try:
+    t0 = time.perf_counter()
+    llm_model = "llama-3.1-8b-instant"
+    llm = ChatGroq(model=llm_model)
+    logger.info("LLM initialized: model=%s | %.2f ms", llm_model, (time.perf_counter() - t0) * 1000)
+except Exception:
+    logger.exception("Failed to initialize LLM")
+    st.error("Failed to initialize the language model. See logs for details.")
+    st.stop()
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="Budget Chatbot", page_icon="💬")
+st.title("💬 Budget Chatbot Assistant")
+
+# Clear chat button & optional persistence
+HISTORY_FILE = "chat_history.json"
+
+def save_history():
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(st.session_state["messages"], f)
+    except Exception:
+        logger.debug("Could not persist chat history.", exc_info=True)
+
+def load_history():
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        logger.debug("Could not load persisted chat history.", exc_info=True)
+    return None
+
+if "messages" not in st.session_state:
+    st.session_state["messages"] = load_history() or [
+        {"role": "assistant", "content": "Hi! Ask me anything about the budget documents."}
+    ]
+
+if st.button("Clear Chat"):
+    st.session_state.clear()
+    try:
+        if os.path.exists(HISTORY_FILE):
+            os.remove(HISTORY_FILE)
+    except Exception:
+        logger.debug("Could not delete history file.", exc_info=True)
+    st.rerun()
+
+
+# -----------------------------
+# VectorStore
+# -----------------------------
+vectorstore_path = r"C:\New RAG PROJECT\my_vectorstore_old"  # ensure this path is trusted
+try:
+    t0 = time.perf_counter()
+    vectorstore = FAISS.load_local(
+        vectorstore_path,
+        embeddings,
+        allow_dangerous_deserialization=True,  # only use for trusted indexes
+    )
+    load_ms = (time.perf_counter() - t0) * 1000
+    index_size = getattr(getattr(vectorstore, "index", None), "ntotal", None)
+    logger.info(
+        "Vector store loaded: path='%s' | %.2f ms%s",
+        vectorstore_path,
+        load_ms,
+        f" | index_size={index_size}" if index_size is not None else "",
+    )
+except Exception:
+    logger.exception("Failed to load FAISS vectorstore from %s", vectorstore_path)
+    st.error("Unable to load the vector store. Please verify the path and permissions.")
+    st.stop()
+
+# Base retriever + MultiQuery retriever
+base_retriever = vectorstore.as_retriever()  # you can pass search_kwargs={"k": 6} if needed
+try:
+    multiquery_retriever = MultiQueryRetriever.from_llm(
+        retriever=base_retriever,
+        llm=llm,
+    )
+    logger.info("MultiQueryRetriever enabled.")
+except Exception:
+    logger.exception("Failed to initialize MultiQueryRetriever; falling back to base retriever.")
+    multiquery_retriever = base_retriever
+
+
+# -----------------------------
+# Chains
+# -----------------------------
+try:
+    context_prompt = ChatPromptTemplate.from_messages([
+        ("system", "Refactor the question using chat history for context."),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ])
+
+    # Use MultiQuery retriever inside history-aware retriever
+    history_aware_ret = create_history_aware_retriever(llm, multiquery_retriever, context_prompt)
+    logger.debug("History-aware retriever created with MultiQuery retriever.")
+
+    system_prompt = (
+        "You are a helpful assistant. Use the following context to answer the question: "
+        "{context}. If unsure, respond with 'I don't know.'"
+    )
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ])
+    qa_chain = create_stuff_documents_chain(llm, prompt)
+    rag_chain = create_retrieval_chain(history_aware_ret, qa_chain)
+    logger.info("RAG chain created successfully.")
+except Exception:
+    logger.exception("Failed to create RAG chain")
+    st.error("Failed to build the RAG pipeline. See logs for details.")
+    st.stop()
+
+
+# -----------------------------
+# Display prior messages
+# -----------------------------
+for msg in st.session_state["messages"]:
+    st.chat_message(msg["role"]).write(msg["content"])
+
+
+# -----------------------------
+# Handle user input
+# -----------------------------
+user_input = st.chat_input("Ask a question...")
+if user_input:
+    request_id = str(uuid.uuid4())[:8]  # correlation ID for this turn
+    st.session_state["messages"].append({"role": "user", "content": user_input})
+    st.chat_message("user").write(user_input)
+
+    # Log minimal info (avoid storing raw prompt content)
+    logger.info("Q[%s]: len=%d chars | history_len=%d", request_id, len(user_input), len(st.session_state["messages"]))
+
+    with st.chat_message("assistant"):
+        try:
+            t0 = time.perf_counter()
+            chat_history = [{"role": m["role"], "content": m["content"]} for m in st.session_state["messages"]]
+
+            result = rag_chain.invoke({"input": user_input, "chat_history": chat_history})
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+
+            answer = result.get("answer", "I don't know.")
+            st.session_state["messages"].append({"role": "assistant", "content": answer})
+            st.write(answer)
+
+            # --- Sources with PDF page numbers (and chunk fallback) ---
+            try:
+                docs = result.get("context", None)  # may be string; fallback to explicit retrieval
+                if not isinstance(docs, list):
+                    docs = history_aware_ret.invoke({"input": user_input, "chat_history": chat_history})
+                if docs:
+                    st.markdown("**Sources:**")
+                    shown = set()
+                    for d in docs:
+                        src = d.metadata.get("source", "Unknown source")
+                        page = d.metadata.get("page", None)      # expected for PDFs
+                        chunk_id = d.metadata.get("chunk_id", None)
+                        name = Path(src).name if src else "Unknown source"
+
+                        # Convert to 1-based pages for PDFs (PyPDFLoader often sets 0-based)
+                        display_page = page
+                        if isinstance(page, int) and name.lower().endswith(".pdf"):
+                            display_page = page + 1
+
+                        key = (name, display_page if display_page is not None else chunk_id)
+                        if key in shown:
+                            continue
+                        shown.add(key)
+
+                        if display_page is not None:
+                            st.markdown(f"- {name}, **page {display_page}**")
+                        elif chunk_id is not None:
+                            st.markdown(f"- {name}, **chunk {chunk_id}**")
+                        else:
+                            st.markdown(f"- {name}")
+
+                        if len(shown) >= 3:
+                            break
+
+                    logger.info("Citations: %s", list(shown))
+            except Exception:
+                logger.debug("Could not render or log citations.", exc_info=True)
+            # -----------------------------------------------------
+
+            # Save persistent history
+            save_history()
+
+            logger.info("A[%s]: len=%d chars | latency=%.2f ms | keys=%s",
+                        request_id, len(answer), elapsed_ms, list(result.keys()))
+        except Exception:
+            logger.exception("Invocation failed for request_id=%s", request_id)
+            st.error("Something went wrong while answering. Please try again.")

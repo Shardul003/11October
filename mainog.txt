@@ -1,0 +1,210 @@
+import os
+import json
+import sqlite3
+import tempfile
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+import logging
+import streamlit as st
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_community.vectorstores import FAISS
+
+# ---------------------- Logging Setup ----------------------
+logging.basicConfig(filename="app.log", level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ---------------------- Database Setup ----------------------
+DB_PATH = "patient_data.db"
+conn = sqlite3.connect(DB_PATH)
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS patient_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_name TEXT,
+    patient_age TEXT,
+    sample_date TEXT,
+    extracted_json TEXT,
+    explanations_json TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS app_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT,
+    details TEXT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""")
+conn.commit()
+
+# ---------------------- Environment ----------------------
+load_dotenv()
+os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN", "")
+os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY", "")
+
+# ---------------------- UI Config ----------------------
+st.set_page_config(page_title="Lab/Radiology Summarizer", page_icon="🧬", layout="wide")
+st.title("🧬 Lab & Radiology Report Summarizer")
+
+DEFAULT_KB_DIR = os.path.abspath("./kb")
+Path(DEFAULT_KB_DIR).mkdir(parents=True, exist_ok=True)
+
+# ---------------------- Helpers ----------------------
+def log_action(action: str, details: str):
+    logging.info(f"{action}: {details}")
+    cursor.execute("INSERT INTO app_logs (action, details) VALUES (?, ?)", (action, details))
+    conn.commit()
+
+def _tempfile_from_upload(upload_file, suffix: str) -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(upload_file.read())
+        return tmp.name
+
+def load_docs_from_uploads(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> List[Document]:
+    docs: List[Document] = []
+    for uf in uploaded_files:
+        name_lower = uf.name.lower()
+        if name_lower.endswith(".pdf"):
+            tmp_pdf = _tempfile_from_upload(uf, ".pdf")
+            loader = PyPDFLoader(tmp_pdf)
+            page_docs = loader.load()
+            for d in page_docs:
+                d.metadata["source"] = uf.name
+            docs.extend(page_docs)
+        elif name_lower.endswith(".txt"):
+            tmp_txt = _tempfile_from_upload(uf, ".txt")
+            loader = TextLoader(tmp_txt, encoding="utf-8")
+            text_docs = loader.load()
+            for d in text_docs:
+                d.metadata["source"] = uf.name
+            docs.extend(text_docs)
+        else:
+            st.warning(f"Unsupported file type: {uf.name}. Only .pdf and .txt allowed.")
+    return docs
+
+@st.cache_resource(show_spinner=False)
+def build_embeddings():
+    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+@st.cache_resource(show_spinner=False)
+def build_llm(model_name: str = "llama-3.1-8b-instant") -> ChatGroq:
+    return ChatGroq(model=model_name, temperature=0.2)
+
+# ---------------------- KB ----------------------
+LAB_KB_MINI = {
+    "Hemoglobin": {"layman": "Hemoglobin carries oxygen in blood.", "conditions": [{"name": "Anemia", "url": "https://medlineplus.gov/anemia.html"}]},
+    "WBC": {"layman": "White blood cells fight infection.", "conditions": [{"name": "Infection", "url": "https://medlineplus.gov/ency/article/003643.htm"}]},
+    "HbA1c": {"layman": "HbA1c shows average blood sugar.", "conditions": [{"name": "Diabetes", "url": "https://medlineplus.gov/diabetes.html"}]},
+    "TSH": {"layman": "TSH controls thyroid.", "conditions": [{"name": "Hypothyroidism", "url": "https://medlineplus.gov/hypothyroidism.html"}]}
+}
+
+def kb_docs_from_mini() -> List[Document]:
+    docs: List[Document] = []
+    for analyte, info in LAB_KB_MINI.items():
+        txt = f"# {analyte}\n{info.get('layman','')}\n" + "\n".join([f"- {c['name']}: {c['url']}" for c in info.get("conditions", [])])
+        docs.append(Document(page_content=txt, metadata={"source": f"KB: {analyte}"}))
+    return docs
+
+def build_kb_vectorstore(embeddings, include_builtin=True) -> Optional[FAISS]:
+    docs: List[Document] = []
+    if include_builtin:
+        docs.extend(kb_docs_from_mini())
+    if not docs:
+        return None
+    return FAISS.from_documents(docs, embeddings)
+
+# ---------------------- Prompts ----------------------
+def build_lab_extraction_prompt() -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_messages([
+        ("system", "Extract structured findings as JSON: {{\"sample_date\": str|null, \"patient_age\": str|null, \"tests\": [{{\"test_name\": str, \"value\": str, \"unit\": str|null, \"ref_low\": str|null, \"ref_high\": str|null, \"flag\": \"low\"|\"normal\"|\"high\"|\"unknown\"}}]}}."),
+        ("human", "Lab text:\n```{lab_text}```")
+    ])
+
+def extract_lab_findings(llm: ChatGroq, lab_text: str) -> Dict[str, Any]:
+    prompt = build_lab_extraction_prompt()
+    msg = prompt.format_messages(lab_text=lab_text[:5000])  # limit to 5000 chars
+    resp = llm.invoke(msg)
+    content = resp.content.strip()
+    start, end = content.find("{"), content.rfind("}")
+    if start != -1 and end != -1:
+        content = content[start:end+1]
+    try:
+        return json.loads(content)
+    except:
+        return {"sample_date": None, "patient_age": None, "tests": []}
+
+def build_explainer_prompt() -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_messages([
+        ("system", "Explain findings in layman terms using context. No medical advice.\nContext:\n{context}"),
+        ("human", "Test: {test_name}, Value: {value} {unit}, Ref: {ref_low}-{ref_high}, Flag: {flag}")
+    ])
+
+def explain_finding_with_kb(llm: ChatGroq, kb_vs: Optional[FAISS], test: Dict[str, Any]) -> str:
+    context = ""
+    if kb_vs:
+        retriever = kb_vs.as_retriever(search_kwargs={"k": 3})
+        ctx_docs = retriever.invoke(test.get("test_name", ""))  # ✅ FIXED
+        context = "\n".join([d.page_content for d in ctx_docs])
+    prompt = build_explainer_prompt()
+    msg = prompt.format_messages(context=context[:4000], test_name=test.get("test_name"), value=test.get("value"), unit=test.get("unit",""), ref_low=test.get("ref_low"), ref_high=test.get("ref_high"), flag=test.get("flag"))
+    return llm.invoke(msg).content
+
+# ---------------------- Tabs ----------------------
+tab1, tab2 = st.tabs(["🧬 Summarizer", "♻️ Reset"])
+
+with tab1:
+    st.header("Upload and Extract")
+    model_name = st.selectbox("Groq model", ["llama-3.1-8b-instant", "llama-3.1-70b-versatile"], index=0)
+    include_builtin_kb = st.checkbox("Include built-in KB", value=True)
+    lab_files = st.file_uploader("Upload lab/radiology report(s)", type=["pdf","txt"], accept_multiple_files=True)
+    if st.button("🔍 Extract & Explain"):
+        if lab_files:
+            try:
+                docs = load_docs_from_uploads(lab_files)
+                joined_text = "\n".join([d.page_content for d in docs])
+                emb = build_embeddings()
+                kb_vs = build_kb_vectorstore(emb, include_builtin=include_builtin_kb)
+                llm = build_llm(model_name)
+                extracted = extract_lab_findings(llm, joined_text)
+                tests = extracted.get("tests", [])
+                notable = [t for t in tests if t.get("flag") in {"low","high"}] or tests[:5]
+                explanations = {f"{t['test_name']}|{t['value']}|{t['flag']}": explain_finding_with_kb(llm, kb_vs, t) for t in notable}
+
+                # Store in DB
+                cursor.execute("INSERT INTO patient_reports (patient_name, patient_age, sample_date, extracted_json, explanations_json) VALUES (?, ?, ?, ?, ?)",
+                               ("Unknown", extracted.get("patient_age") or "Unknown", extracted.get("sample_date") or "Unknown", json.dumps(extracted), json.dumps(explanations)))
+                conn.commit()
+                log_action("Extraction", f"Processed {len(tests)} tests")
+                st.session_state["lab_summary"] = {"extracted": extracted, "explanations": explanations}
+            except Exception as e:
+                log_action("Error", str(e))
+                st.error(f"Error during extraction: {e}")
+    if "lab_summary" in st.session_state:
+        st.subheader("📄 Summary (Educational only)")
+        data = st.session_state["lab_summary"]["extracted"]
+        explanations = st.session_state["lab_summary"]["explanations"]
+        st.json(data)
+        st.markdown("### 🧾 Explanations")
+        for key, md in explanations.items():
+            st.markdown(f"**{key}**\n{md}")
+        st.info("This tool is for education only and is NOT a diagnosis.")
+
+with tab2:
+    st.header("Reset Application")
+    if st.button("Clear Session State"):
+        st.session_state.clear()
+        st.success("Session state cleared.")
+    if st.button("Clear Database"):
+        cursor.execute("DELETE FROM patient_reports")
+        cursor.execute("DELETE FROM app_logs")
+        conn.commit()
+        st.success("Database cleared.")
+    if st.button("Clear Logs"):
+        open("app.log", "w").close()
+        st.success("Log file cleared.")

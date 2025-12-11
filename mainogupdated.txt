@@ -1,0 +1,571 @@
+# app.py
+# ------------------------------
+# Lab/Radiology Summarizer (Text-only, Graphs Ignored)
+# Deterministic parsing -> LLM for explanations
+# ------------------------------
+
+import os
+import re
+import json
+import sqlite3
+import tempfile
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+
+import logging
+import streamlit as st
+from dotenv import load_dotenv
+
+# LangChain
+from langchain_community.document_loaders import TextLoader
+from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_community.vectorstores import FAISS
+
+# PDF text
+import fitz  # pymupdf
+
+# ---------------------- Logging Setup ----------------------
+logging.basicConfig(filename="app.log", level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+
+def log_action(action: str, details: str):
+    logging.info(f"{action}: {details}")
+    cursor.execute("INSERT INTO app_logs (action, details) VALUES (?, ?)", (action, details))
+    conn.commit()
+
+# ---------------------- Environment ----------------------
+load_dotenv()
+os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN", "")
+os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY", "")
+
+# ---------------------- Database Setup ----------------------
+DB_PATH = "patient_data.db"
+conn = sqlite3.connect(DB_PATH)
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS patient_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  patient_name TEXT,
+  patient_age TEXT,
+  sample_date TEXT,
+  extracted_json TEXT,
+  explanations_json TEXT,
+  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS app_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  action TEXT,
+  details TEXT,
+  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""")
+conn.commit()
+
+# ---------------------- UI Config ----------------------
+st.set_page_config(page_title="Lab/Radiology Summarizer", page_icon="🧬", layout="wide")
+st.title("🧬 Lab & Radiology Report Summarizer (Text-only)")
+
+DEFAULT_KB_DIR = os.path.abspath("./kb_store")
+Path(DEFAULT_KB_DIR).mkdir(parents=True, exist_ok=True)
+
+# ---------------------- Helpers ----------------------
+def _tempfile_from_upload(upload_file, suffix: str) -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(upload_file.read())
+        return tmp.name
+
+def load_docs_from_uploads(uploaded_files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> List[Document]:
+    """Load only .txt here; PDFs are handled by our custom cleaner."""
+    docs: List[Document] = []
+    for uf in uploaded_files:
+        name_lower = uf.name.lower()
+        if name_lower.endswith(".txt"):
+            tmp_txt = _tempfile_from_upload(uf, ".txt")
+            loader = TextLoader(tmp_txt, encoding="utf-8")
+            text_docs = loader.load()
+            for d in text_docs:
+                d.metadata["source"] = uf.name
+            docs.extend(text_docs)
+        elif name_lower.endswith(".pdf"):
+            pass  # handled elsewhere
+        else:
+            st.warning(f"Unsupported file type: {uf.name}. Only .pdf and .txt allowed.")
+    return docs
+
+@st.cache_resource(show_spinner=False)
+def build_embeddings():
+    # stronger small model than MiniLM-L6 for retrieval quality
+    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L12-v2")
+
+@st.cache_resource(show_spinner=False)
+def build_llm(model_name: str = "llama-3.1-8b-instant") -> ChatGroq:
+    return ChatGroq(model=model_name, temperature=0.2)
+
+# ============================================================
+#                  PDF Cleaning (skip graphs)
+# ============================================================
+SKIP_PAGE_PATTERNS = [
+    r"Bio-Rad CDM System", r"PATIENT REPORT", r"Time \(min\)", r"P\d+\s*Peak",
+    r"A2 Concentration", r"Analysis Data", r"Instrument Name:\s*BIORAD VARIANT"
+]
+HEADER_FOOTER_PATTERNS = [
+    r"LABORATORY TEST REPORT", r"Scan QR code", r"National Reference Laboratory",
+    r"This is an Electronically Authenticated Report\.", r"Page \d+ of \d+",
+    r"Email:\s*.*", r"Website:\s*.*", r"Ph\s*\.?:\s*.*"
+]
+PII_PATTERNS = [
+    r"Name\s*:\s*.*", r"Lab Id\s*:\s*.*", r"Passport No\s*:\s*.*", r"Client Name\s*:\s*.*",
+    r"Location\s*:\s*.*", r"Ref\. Id\s*:\s*.*", r"Ref\. By\s*:\s*.*", r"Process At\s*:\s*.*"
+]
+
+def _should_skip_page(text: str) -> bool:
+    return any(re.search(rx, text, re.I) for rx in SKIP_PAGE_PATTERNS)
+
+def _strip_header_footer(text: str) -> str:
+    for rx in HEADER_FOOTER_PATTERNS:
+        text = re.sub(rx, "", text, flags=re.I)
+    for rx in PII_PATTERNS:
+        text = re.sub(rx, "", text, flags=re.I)
+    # Often the lab name repeats; keep generic
+    text = re.sub(r"Sterling\s+Accuris.*", "", text, flags=re.I)
+    return text
+
+def clean_text_from_pdf(pdf_path: str) -> str:
+    """Extract text from PDF pages, skipping chart/graph pages and stripping headers/footers/PII."""
+    doc = fitz.open(pdf_path)
+    out = []
+    for page in doc:
+        raw = page.get_text("text") or ""
+        if not raw:
+            continue
+        if _should_skip_page(raw):
+            # ignore visual/graph pages explicitly
+            continue
+        txt = _strip_header_footer(raw)
+        txt = re.sub(r"[ \t]+", " ", txt)          # normalize spaces
+        txt = re.sub(r"\n{2,}", "\n", txt)         # collapse blank lines
+        out.append(txt.strip())
+    doc.close()
+    return "\n".join(out)
+
+# ============================================================
+#            Normalization, Ranges, Flags (deterministic)
+# ============================================================
+FLAG_TOKEN = re.compile(r"\b([HL])\b", re.I)
+NUM_TOKEN  = re.compile(r"([<>]?\s*-?\d+\.?\d*)")
+RANGE_HYPHEN = re.compile(r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)")
+
+def _clean_inline_flag_value(tokens: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract inline H/L flag and numeric token ('< 148', '141', etc.).
+    Returns ('high'/'low'/None, 'value_str' or None)
+    """
+    flag = None
+    mflag = FLAG_TOKEN.search(tokens)
+    if mflag:
+        flag = "high" if mflag.group(1).upper() == "H" else "low"
+        tokens = FLAG_TOKEN.sub("", tokens)
+
+    mnum = NUM_TOKEN.search(tokens)
+    if not mnum:
+        return flag, None
+    value = mnum.group(1).strip()
+    return flag, value
+
+def _parse_range(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Keep ranges as text ('40-49', '<200', '>4.94') for traceability.
+    We'll convert them to float as needed for comparisons.
+    """
+    text = text or ""
+    mh = RANGE_HYPHEN.search(text)
+    if mh:
+        return mh.group(1), mh.group(2)
+    ml = re.search(r"<\s*(\d+\.?\d*)", text)
+    if ml:
+        return None, f"<{ml.group(1)}"
+    mg = re.search(r">=?\s*(\d+\.?\d*)", text)
+    if mg:
+        return f">{mg.group(1)}", None
+    return None, None
+
+def _to_float_or_none(s: Optional[str]) -> Optional[float]:
+    if s is None:
+        return None
+    s = s.replace(",", "").strip()
+    s = s.lstrip("<>").strip()
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _compute_flag(v: Optional[float], low_txt: Optional[str], high_txt: Optional[str]) -> str:
+    if v is None:
+        return "unknown"
+    low = _to_float_or_none(low_txt)
+    high = _to_float_or_none(high_txt)
+
+    # textual '<200' or '>4.94'
+    if (low is None) and high_txt and isinstance(high_txt, str) and high_txt.startswith("<"):
+        high = _to_float_or_none(high_txt)
+        return "high" if v >= (high or 1e12) else "normal"
+    if (high is None) and low_txt and isinstance(low_txt, str) and low_txt.startswith(">"):
+        low = _to_float_or_none(low_txt)
+        return "low" if v <= (low or -1e12) else "normal"
+
+    if low is not None and v < low:
+        return "low"
+    if high is not None and v > high:
+        return "high"
+    return "normal"
+
+# ============================================================
+#             Deterministic extraction from text
+# ============================================================
+UNITS = r"(mg/dL|g/dL|pg|fL|%|U/L|mmol/L|microIU/mL|ng/mL|micromol/L|IU/mL|/cmm|million/cmm|mm/1hr|S/Co|ng/ml|mg/L|/hpf|fL)"
+PANEL_HEADS = [
+    "Complete Blood Count", "Lipid Profile", "Biochemistry", "Thyroid Function Test",
+    "Immunoassay", "Iron Studies", "HB Electrophoresis", "Blood Group", "Protein", "Bilirubin",
+    "Electrolytes", "Urine", "Microalbumin", "Vitamin", "Erythrocyte Sedimentation Rate"
+]
+NOISY_TOKENS = [
+    "Calculated", "Derived", "Chemiluminescence", "Electrical impedance", "PTA/MgCl2",
+    "GOD-POD", "Uricase", "Arsenazo III", "Direct measured", "CLIA", "SF Cube cell analysis",
+    "Capillary photometry", "Cationic Mordant Binding", "Pyridyl azo Dye", "Immunoturbidimetric",
+    "UV with P5P, IFCC", "UV with P5P", "Double indicator", "Polyelectrolyte based reaction",
+    "Colorimetric", "Bromocresol Green Method", "Azobilirubin chromophores"
+]
+
+def _split_panels(text: str) -> Dict[str, List[str]]:
+    lines = [l for l in text.splitlines() if l.strip()]
+    panels: Dict[str, List[str]] = {"_root": []}
+    current = "_root"
+    for ln in lines:
+        found = next((h for h in PANEL_HEADS if h.lower() in ln.lower()), None)
+        if found:
+            current = found
+            panels.setdefault(current, [])
+        panels[current].append(ln)
+    return panels
+
+def _has_value_and_unit(line: str) -> bool:
+    return bool(re.search(UNITS, line)) and bool(re.search(r"[<>]?\s*-?\d+\.?\d*", line))
+
+def _clean_name(name: str) -> str:
+    for tok in NOISY_TOKENS:
+        name = re.sub(rf"\b{re.escape(tok)}\b", "", name, flags=re.I)
+    name = re.sub(r"\s{2,}", " ", name).strip(":-• ")
+    return name
+
+def extract_tests_from_panel(lines: List[str], strict: bool) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for line in lines:
+        l = " ".join(line.split())
+        if strict and not _has_value_and_unit(l):
+            continue
+        if not re.search(UNITS, l):
+            continue
+
+        flag_inline, val_txt = _clean_inline_flag_value(l)
+        unit_m = re.search(UNITS, l, re.I)
+        unit = unit_m.group(1) if unit_m else None
+
+        # Heuristic: name is everything before the numeric token we picked
+        name = l
+        if val_txt and l.find(val_txt) > 0:
+            name = l[:l.find(val_txt)].strip()
+        name = _clean_name(name)
+
+        # Try to pull a reference interval from the same line
+        ref_low, ref_high = None, None
+        mh = re.search(r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)", l)
+        ml = re.search(r"<\s*\d+\.?\d*", l)
+        mg = re.search(r">\s*\d+\.?\d*", l)
+        if mh:
+            ref_low, ref_high = _parse_range(mh.group(0))
+        elif ml:
+            ref_low, ref_high = _parse_range(ml.group(0))
+        elif mg:
+            ref_low, ref_high = _parse_range(mg.group(0))
+
+        v_float = _to_float_or_none(val_txt)
+        flag = flag_inline or _compute_flag(v_float, ref_low, ref_high)
+
+        if name and (v_float is not None) and unit:
+            out.append({
+                "test_name": name,
+                "value": f"{v_float}",
+                "unit": unit,
+                "ref_low": ref_low,
+                "ref_high": ref_high,
+                "flag": flag
+            })
+    return out
+
+def extract_report(text: str, strict: bool = True) -> Dict[str, Any]:
+    panels = _split_panels(text)
+    tests: List[Dict[str, Any]] = []
+    for _, lines in panels.items():
+        tests.extend(extract_tests_from_panel(lines, strict=strict))
+
+    # Deduplicate by (name, unit) keeping the last occurrence
+    dedup: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for t in tests:
+        key = (t["test_name"].lower(), t.get("unit", "").lower())
+        dedup[key] = t
+    tests = list(dedup.values())
+    return {"sample_date": None, "patient_age": None, "tests": tests}
+
+# ============================================================
+#                   Canonical name mapping
+# ============================================================
+ALIASES = {
+    "HbA1c": ["Glycosylated Hemoglobin", "Hemoglobin A1c", "Hb A1c", "HbA1c"],
+    "Fasting Blood Sugar": ["FBS", "Fasting Plasma Glucose", "Fasting Blood Glucose", "Fasting Blood Sugar"],
+    "Triglycerides": ["Triglyceride"],
+    "WBC": ["WBC Count", "Total WBC"],
+    "Platelet Count": ["Platelets", "Platelet"],
+    "ALT": ["SGPT", "SGPT "],
+    "AST": ["SGOT", "SGOT "],
+    "25(OH) Vitamin D": ["Vitamin D", "25-OH Vitamin D", "Vit D", "25(OH) Vit D", "25(OH) Vitamin D"],
+    "TSH": ["Thyroid Stimulating Hormone", "TSH "],
+    "LDL Cholesterol": ["Direct LDL", "LDL", "LDL "],
+    "HDL Cholesterol": ["HDL", "HDL "],
+    "Creatinine": ["Creatinine, Serum", "Creatinine "],
+    "Urea": ["Urea "],
+    "BUN": ["Blood Urea Nitrogen"],
+    "MPV": ["MPV "],
+    "IgE": [" IgE", "IgE "],
+    "Homocysteine": ["Homocysteine, Serum"]
+}
+
+def canonicalize(name: str) -> str:
+    nm = name.strip()
+    for canon, alist in ALIASES.items():
+        if nm.lower() == canon.lower() or any(nm.lower() == a.lower() for a in alist):
+            return canon
+    return nm
+
+# ============================================================
+#                         Mini KB
+# ============================================================
+LAB_KB_MINI = {
+    "Hemoglobin": {"layman": "Hemoglobin carries oxygen in blood.",
+                   "conditions": [{"name": "Anemia", "url": "https://medlineplus.gov/anemia.html"}]},
+    "WBC": {"layman": "White blood cells fight infection.",
+            "conditions": [{"name": "Infection", "url": "https://medlineplus.gov/ency/article/003643.htm"}]},
+    "HbA1c": {"layman": "HbA1c shows average blood sugar (last ~2–3 months).",
+              "conditions": [{"name": "Diabetes", "url": "https://medlineplus.gov/diabetes.html"}]},
+    "TSH": {"layman": "TSH helps regulate thyroid function.",
+            "conditions": [{"name": "Hypothyroidism", "url": "https://medlineplus.gov/hypothyroidism.html"}]},
+    "Triglycerides": {"layman": "Triglycerides are a type of fat in your blood.",
+                      "conditions": [{"name": "High triglycerides", "url": "https://medlineplus.gov/cholesterol.html"}]},
+    "25(OH) Vitamin D": {"layman": "Vitamin D helps bones and muscles; low levels are common.",
+                         "conditions": [{"name": "Vitamin D deficiency", "url": "https://medlineplus.gov/vitamind.html"}]},
+    "Vitamin B12": {"layman": "Vitamin B12 supports red blood cells and nerves.",
+                    "conditions": [{"name": "Vitamin B12 deficiency", "url": "https://medlineplus.gov/vitaminb12.html"}]},
+    "Homocysteine": {"layman": "Homocysteine is an amino acid; high levels can relate to B12/folate status.",
+                     "conditions": [{"name": "High homocysteine", "url": "https://medlineplus.gov/homocysteine.html"}]},
+    "IgE": {"layman": "IgE can be high in allergies.",
+            "conditions": [{"name": "Allergy/Atopy", "url": "https://medlineplus.gov/allergy.html"}]},
+}
+
+def kb_docs_from_mini() -> List[Document]:
+    docs: List[Document] = []
+    for analyte, info in LAB_KB_MINI.items():
+        txt = f"# {analyte}\n{info.get('layman','')}\n" + \
+              "\n".join([f"- {c['name']}: {c['url']}" for c in info.get("conditions", [])])
+        docs.append(Document(page_content=txt, metadata={"source": f"KB: {analyte}"}))
+    return docs
+
+def build_kb_vectorstore(embeddings, include_builtin=True) -> Optional[FAISS]:
+    docs: List[Document] = []
+    if include_builtin:
+        docs.extend(kb_docs_from_mini())
+    if not docs:
+        return None
+    vs = FAISS.from_documents(docs, embeddings)
+    return vs
+
+# ============================================================
+#                       Explainer Prompt
+# ============================================================
+def build_explainer_prompt() -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_messages([
+        ("system",
+         "You explain lab/radiology findings in lay terms. "
+         "No diagnosis or treatment advice. Keep it factual, readable, 3–5 bullets. "
+         "Use the given context where relevant and include 1–2 URLs from the context.\n"
+         "Context:\n{context}"),
+        ("human",
+         "Test: {test_name}\nValue: {value} {unit}\nReference: {ref_low}-{ref_high}\nFlag: {flag}\nAudience: layperson")
+    ])
+
+def explain_finding_with_kb(llm: ChatGroq, kb_vs: Optional[FAISS], test: Dict[str, Any]) -> str:
+    context = ""
+    if kb_vs:
+        retriever = kb_vs.as_retriever(search_kwargs={"k": 3})
+        ctx_docs = retriever.invoke(test.get("test_name", ""))
+        context = "\n".join([d.page_content for d in ctx_docs])
+    prompt = build_explainer_prompt()
+    msg = prompt.format_messages(
+        context=context[:4000],
+        test_name=test.get("test_name"),
+        value=test.get("value"),
+        unit=test.get("unit", ""),
+        ref_low=test.get("ref_low"),
+        ref_high=test.get("ref_high"),
+        flag=test.get("flag")
+    )
+    return llm.invoke(msg).content
+
+# ============================================================
+#                   "What stands out" text (no charts)
+# ============================================================
+def _relative_severity(t: Dict[str, Any]) -> float:
+    """Rank by how far outside range we are; fall back to arbitrary weight for unknown ranges."""
+    v = _to_float_or_none(t.get("value"))
+    if v is None:
+        return 0.0
+    lo = _to_float_or_none(t.get("ref_low"))
+    hi = _to_float_or_none(t.get("ref_high"))
+    if lo is not None and hi is not None and hi > lo:
+        if v < lo:
+            return (lo - v) / (hi - lo + 1e-9)
+        if v > hi:
+            return (v - hi) / (hi - lo + 1e-9)
+        return 0.0
+    # textual '<' or '>'
+    if t.get("ref_high") and str(t["ref_high"]).startswith("<") and v is not None:
+        rh = _to_float_or_none(t["ref_high"])
+        return max(0.5, (v - (rh or v)) / ((rh or v) + 1e-9)) if v and rh else 0.5
+    if t.get("ref_low") and str(t["ref_low"]).startswith(">") and v is not None:
+        rl = _to_float_or_none(t["ref_low"])
+        return max(0.5, ((rl or v) - v) / ((rl or v) + 1e-9)) if v and rl else 0.5
+    return 0.3 if t.get("flag") in {"high", "low"} else 0.0
+
+def summarize_standouts(tests: List[Dict[str, Any]], max_items: int = 6) -> List[str]:
+    abn = [t for t in tests if t.get("flag") in {"high", "low"}]
+    abn.sort(key=_relative_severity, reverse=True)
+    out = []
+    for t in abn[:max_items]:
+        name = t.get("test_name")
+        val = t.get("value")
+        unit = t.get("unit", "")
+        flg = t.get("flag")
+        rng = f"{t.get('ref_low')}-{t.get('ref_high')}" if (t.get('ref_low') or t.get('ref_high')) else "—"
+        out.append(f"- **{name}** {val} {unit} ({flg}); reference {rng}")
+    return out
+
+# ============================================================
+#                           UI Tabs
+# ============================================================
+tab1, tab2 = st.tabs(["🧬 Summarizer", "♻️ Reset"])
+
+with tab1:
+    st.header("Upload and Extract (Text-only parsing; graphs ignored)")
+
+    model_name = st.selectbox("Groq model",
+                              ["llama-3.1-8b-instant", "llama-3.1-70b-versatile"],
+                              index=0)
+    include_builtin_kb = st.checkbox("Include built-in KB", value=True)
+    strict_mode = st.checkbox("Stricter row filter (value+unit must be on same line)", value=True)
+
+    lab_files = st.file_uploader("Upload lab/radiology report(s)",
+                                 type=["pdf", "txt"], accept_multiple_files=True)
+
+    if st.button("🔎 Extract & Explain"):
+        if not lab_files:
+            st.warning("Please upload at least one PDF or TXT.")
+        else:
+            try:
+                # Build cleaned text
+                joined_text = ""
+                txt_docs = load_docs_from_uploads(lab_files)
+
+                # capture text docs
+                for d in txt_docs:
+                    joined_text += d.page_content + "\n"
+
+                # handle PDFs with deterministic cleaner
+                for uf in lab_files:
+                    if uf.name.lower().endswith(".pdf"):
+                        tmp_pdf = _tempfile_from_upload(uf, ".pdf")
+                        joined_text += clean_text_from_pdf(tmp_pdf) + "\n"
+
+                # --- Deterministic extraction ---
+                extracted = extract_report(joined_text, strict=strict_mode)
+
+                # canonicalize names
+                for t in extracted.get("tests", []):
+                    t["test_name"] = canonicalize(t["test_name"])
+
+                # Embeddings / KB / LLM
+                emb = build_embeddings()
+                kb_vs = build_kb_vectorstore(emb, include_builtin=include_builtin_kb)
+                llm = build_llm(model_name)
+
+                tests = extracted.get("tests", [])
+                notable = [t for t in tests if t.get("flag") in {"low", "high"}] or tests[:5]
+
+                explanations = {
+                    f"{t['test_name']} | {t.get('value')}{(' '+t.get('unit')) if t.get('unit') else ''} | {t.get('flag')}":
+                        explain_finding_with_kb(llm, kb_vs, t)
+                    for t in notable
+                }
+
+                # store to DB
+                cursor.execute(
+                    "INSERT INTO patient_reports (patient_name, patient_age, sample_date, extracted_json, explanations_json) VALUES (?, ?, ?, ?, ?)",
+                    ("Unknown",
+                     extracted.get("patient_age") or "Unknown",
+                     extracted.get("sample_date") or "Unknown",
+                     json.dumps(extracted),
+                     json.dumps(explanations))
+                )
+                conn.commit()
+                log_action("Extraction", f"Processed {len(tests)} tests")
+
+                st.session_state["lab_summary"] = {"extracted": extracted, "explanations": explanations}
+
+            except Exception as e:
+                log_action("Error", str(e))
+                st.error(f"Error during extraction: {e}")
+
+    if "lab_summary" in st.session_state:
+        st.subheader("📄 Summary (Educational only)")
+        data = st.session_state["lab_summary"]["extracted"]
+        explanations = st.session_state["lab_summary"]["explanations"]
+
+        with st.expander("Parsed JSON (deterministic)"):
+            st.json(data)
+
+        standouts = summarize_standouts(data.get("tests", []), max_items=6)
+        if standouts:
+            st.markdown("### ⭐ What stands out")
+            st.markdown("\n".join(standouts))
+
+        st.markdown("### 🧠 Explanations")
+        for key, md in explanations.items():
+            st.markdown(f"**{key}**\n{md}")
+
+        st.info("This tool is for education only and is NOT a diagnosis or medical advice.")
+
+with tab2:
+    st.header("Reset Application")
+    if st.button("Clear Session State"):
+        st.session_state.clear()
+        st.success("Session state cleared.")
+    if st.button("Clear Database"):
+        cursor.execute("DELETE FROM patient_reports")
+        cursor.execute("DELETE FROM app_logs")
+        conn.commit()
+        st.success("Database cleared.")
+    if st.button("Clear Logs"):
+        open("app.log", "w").close()
+        st.success("Log file cleared.")
