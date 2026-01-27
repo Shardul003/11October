@@ -1,0 +1,13 @@
+
+langchain==0.2.16
+langchain-core==0.2.39
+langchain-community==0.2.16
+
+langgraph==0.2.20
+langchain-groq==0.1.8
+
+faiss-cpu==1.8.0.post1
+sentence-transformers==2.6.1
+langchain-huggingface==0.0.1
+pypdf==4.2.0
+
